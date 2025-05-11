@@ -13,6 +13,7 @@ dependencies = [
     "pandas>=2.2.3",
     "pillow>=11.2.1",
     "plotly>=6.0.1",
+    "pyarrow>=20.0.0",
     "torch-directml>=0.2.5.dev240914",
     "tqdm>=4.67.1",
     "transformers>=4.51.3",

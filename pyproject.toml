@@ -6,20 +6,24 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "click>=8.2.0",
+    "hdbscan>=0.8.40",
     "huggingface-hub[cli]>=0.31.1",
     "imagehash>=4.3.2",
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.7",
     "kaggle>=1.7.4.2",
+    "matplotlib>=3.10.3",
     "nbformat>=5.10.4",
     "openimages>=0.0.1",
     "pandas>=2.2.3",
     "pillow>=11.2.1",
     "plotly>=6.0.1",
     "pyarrow>=20.0.0",
-    "torch-directml>=0.2.5.dev240914",
+    "scikit-learn>=1.6.1",
+    "torch>=2.7.0",
     "tqdm>=4.67.1",
     "transformers>=4.51.3",
+    "umap-learn>=0.5.7",
 ]
 
 [dependency-groups]

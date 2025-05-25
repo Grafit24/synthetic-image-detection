@@ -16,3 +16,6 @@ wheels/
 *.csv
 *.txt
 !processed.csv
+
+*.memmap
+*.zip

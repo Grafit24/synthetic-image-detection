@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Default values
 QUALITY=85
-SIZE="224x224"
+SIZE="768x768"
 WORKERS=16
 
 # Parse options

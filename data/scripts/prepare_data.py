@@ -134,11 +134,21 @@ def get_openimages(datasets_dir: Path) -> pd.DataFrame:
     return df
 
 
+def get_sana(datasets_dir: Path) -> pd.DataFrame:
+    d = datasets_dir / 'sana'
+    df = pd.read_csv(d / 'sana_emb.csv')
+    df["fp"] = df['fp'].apply(lambda x: str(d / x))
+    df['label'] = 1
+    df['model_name'] = df["fp"].apply(lambda x: Path(x).parent.name)
+    return df
+
+
 DATASET_FUNCS = {
     'ai_vs_human_generated': get_ai_vs_human_data,
     'sfhq_t2i': get_sfhq_t2i,
     'sd_faces': parse_sd_faces,
     'openimagesv7': get_openimages,
+    'sana': get_sana
 }
 
 PROCESSED_FUNCS ={

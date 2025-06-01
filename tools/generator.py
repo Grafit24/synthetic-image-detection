@@ -4,12 +4,16 @@ import click
 import torch
 from tqdm import tqdm
 from diffusers import SanaPipeline, SanaSprintPipeline
+from random import choice
+from diffusers.utils.logging import disable_progress_bar
+from concurrent.futures import ThreadPoolExecutor
 
-# Mapping of model sizes to Hugging Face repo IDs
+disable_progress_bar()
+
 MODEL_MAP = {
-    "600M": "stabilityai/sd-sana-1024-600m",
-    "1.6B": "stabilityai/sd-sana-1024-1.6b",
-    "Sprint": "stabilityai/sd-sana-1024-sprint"
+    "600M": "Efficient-Large-Model/Sana_600M_1024px_diffusers",
+    "1.6B": "Efficient-Large-Model/Sana_1600M_1024px_BF16_diffusers",
+    "Sprint": "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers"
 }
 
 @click.command()
@@ -32,20 +36,6 @@ MODEL_MAP = {
     help="Which SANA model to use (1024×1024 versions)."
 )
 @click.option(
-    "--steps",
-    default=50,
-    show_default=True,
-    type=int,
-    help="Number of inference steps."
-)
-@click.option(
-    "--cfg-scale",
-    default=7.5,
-    show_default=True,
-    type=float,
-    help="Guidance scale (classifier-free guidance)."
-)
-@click.option(
     "--seed",
     default=None,
     type=int,
@@ -61,68 +51,48 @@ def main(
     captions_dir: str,
     target_dir: str,
     model_size: str,
-    steps: int,
-    cfg_scale: float,
     seed: int,
     device: str
 ):
-    """
-    Generate images from JSON captions using the SANA pipelines,
-    reading width and height from each file, and using bfloat16 on GPU.
-    """
     captions_path = Path(captions_dir)
     out_path = Path(target_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # Resolve model
     model_id = MODEL_MAP[model_size]
     click.echo(f"Loading {model_size} model {model_id} on {device}...")
 
-    # Determine dtype: use bfloat16 on GPU for performance/quality
     torch_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
 
-    # Load appropriate pipeline
     if model_size == "Sprint":
-        pipe = SanaSprintPipeline.from_pretrained(
-            model_id,
-            torch_dtype=torch_dtype
-        )
+        pipe = SanaSprintPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
     else:
-        pipe = SanaPipeline.from_pretrained(
-            model_id,
-            torch_dtype=torch_dtype
-        )
+        pipe = SanaPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
     pipe = pipe.to(device)
 
-    # Prepare generator
     generator = None
     if seed is not None:
         generator = torch.Generator(device=device).manual_seed(seed)
         click.echo(f"Using seed: {seed}")
 
-    # Iterate and generate
-    for cap_file in tqdm(captions_path.glob("*.json"), desc="Generating images"):
-        data = json.loads(cap_file.read_text(encoding="utf-8"))
-        prompt = data.get("prompt")
-        if not prompt:
-            click.echo(f"Warning: no 'prompt' in {cap_file.name}, skipping.")
-            continue
-        width = data.get("width", 1024)
-        height = data.get("height", 1024)
-
-        output = pipe(
-            prompt=prompt,
-            height=height,
-            width=width,
-            num_inference_steps=steps,
-            guidance_scale=cfg_scale, 
-            generator=generator
-        )
-        image = output.images[0]
-
-        out_file = out_path / f"{cap_file.stem}.png"
-        image.save(out_file)
-        click.echo(f"Saved image for {cap_file.name} -> {out_file}")
+    with ThreadPoolExecutor() as executor:
+        for cap_file in tqdm(captions_path.glob("*.json"), desc="Generating images"):
+            data = json.loads(cap_file.read_text(encoding="utf-8"))
+            prompt = data.get("prompt")
+            if not prompt:
+                click.echo(f"Warning: no 'prompt' in {cap_file.name}, skipping.")
+                continue
+            width = choice([1024] * 6 + [768] * 3 + [512])
+            height = choice([1024] * 6 + [768] * 3 + [512])
+            pipe.set_progress_bar_config(disable=True)
+            output = pipe(
+                prompt=prompt,
+                height=height,
+                width=width,
+                generator=generator
+            )
+            image = output.images[0]
+            out_file = out_path / f"{cap_file.stem}.png"
+            executor.submit(image.save, out_file)
 
 if __name__ == "__main__":
     main()

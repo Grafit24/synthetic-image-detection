@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "click>=8.2.0",
+    "diffusers>=0.33.1",
     "hdbscan>=0.8.40",
     "huggingface-hub[cli,hf-transfer]>=0.31.1",
     "imagehash>=4.3.2",

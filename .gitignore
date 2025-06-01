@@ -20,3 +20,5 @@ wheels/
 *.memmap
 *.zip
 *.json
+
+*.ipynb_checkpoints

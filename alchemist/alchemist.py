@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
+from tqdm import tqdm
 
 from PIL import Image
 
@@ -8,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
-from diffusers.models.transformers.attention_processor import Attention
+from diffusers.models.attention_processor import Attention
 from diffusers.models.transformers.sana_transformer import SanaAttnProcessor2_0
 from diffusers.models.transformers.sana_transformer import SanaTransformer2DModel
 
@@ -19,7 +20,7 @@ from .pipelines import AlchemistSanaPipeline
 class AlchemistSanaAttnProcessor(SanaAttnProcessor2_0):
     def __init__(self):
         super().__init__()
-        self.n_stat = None
+        self._n_stat = None
 
     @property
     def n_stat(self) -> torch.Tensor:
@@ -83,7 +84,7 @@ class AlchemistSanaAttnProcessor(SanaAttnProcessor2_0):
         attn_weights = F.scaled_dot_product_attention(
             query, key, value_identity, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
-        value = attn_weights @ value
+        hidden_states = attn_weights @ value
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
@@ -209,7 +210,18 @@ class Alchemist:
 
     def __init__(self, model_id: str, K: int, prompt: str, t: float = .25):
         self.collector = self.stat_collector()
-        self.pipe = self.pipelines.from_pretrained(model_id)
+        try:
+            self.pipe = self.pipeline.from_pretrained(model_id, torch_dtype=torch.float32)
+        except:
+            from transformers import modeling_utils
+            if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
+                modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none","colwise",'rowwise']
+            self.pipe = self.pipeline.from_pretrained(model_id, torch_dtype=torch.float32)
+        finally:
+            self.pipe.to("cuda")
+            self.pipe.text_encoder = self.pipe.text_encoder.to(torch.bfloat16)
+            self.pipe.transformer = self.pipe.transformer.to(torch.bfloat16)
+        
         self.collector.register_transformer(self.pipe.transformer)
         self._separation_scores = {}
         self._topk_separation_scores = None
@@ -226,9 +238,9 @@ class Alchemist:
             for token_idx in range(s_l.shape[0]):
                 all_scores.append((prc_name, token_idx, float(s_l[token_idx].item())))
 
-        all_scores = [
-            { (prc_name, token_idx): score } for (prc_name, token_idx, score) in all_scores
-        ]
+        all_scores = {
+            (prc_name, token_idx): score for (prc_name, token_idx, score) in all_scores
+        }
         return all_scores
     
     @property
@@ -255,18 +267,18 @@ class Alchemist:
             collate_fn=x_neg_ds.collate_pil_images
         )
         self.collector.clear_stats()
-        for imgs in pos_loader:
+        for imgs in tqdm(pos_loader):
             self.pipe(imgs, prompt=self.prompt, t=self.t)
         
         pos_stats = self.collector.get_collected()
 
         self.collector.clear_stats()
-        for imgs in neg_loader:
+        for imgs in tqdm(neg_loader):
             self.pipe(imgs, prompt=self.prompt, t=self.t)
         
         neg_stats = self.collector.get_collected()
 
-        assert all(set(pos_stats) == set(neg_stats))
+        assert set(pos_stats) == set(neg_stats)
 
         for prc_name in pos_stats:
             pos_stat = pos_stats[prc_name]
@@ -280,22 +292,20 @@ class Alchemist:
         return self._separation_scores
     
     def get_topK_separation_scores(self, K: int = None) -> list[dict[tuple[str, int], float]]:
-        all_scores = self.separation_scores.items()
+        all_scores = list(self.separation_scores.items())
         all_scores.sort(key=lambda x: x[1], reverse=True)
         K = K or self.K
         topk = all_scores[:K]
 
-        result = [
-            { (prc_name, token_idx): score } for (prc_name, token_idx), score in topk
-        ]
+        result = { (prc_name, token_idx): score for (prc_name, token_idx), score in topk}
 
         return result
     
     def score(self, img: Image.Image):
         self.collector.clear_stats()
-        self.pipe(img)
+        self.pipe(img, prompt=self.prompt, t=self.t)
         stats = self.collector.get_collected()
         score = 0
-        for (prc_name, token_idx), _ in self.topk_separation_scores:
+        for (prc_name, token_idx), _ in self.topk_separation_scores.items():
             score += stats[prc_name].squeeze(0)[token_idx]
         return score

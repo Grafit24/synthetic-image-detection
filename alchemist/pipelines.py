@@ -9,10 +9,7 @@ class AlchemistSanaPipeline(SanaPipeline):
         device = self._execution_device
 
         pixel_values = self.image_processor.preprocess(image).to(device)
-
-        vae_output = self.vae.encode(pixel_values)
-        latents = vae_output.latent_dist.sample()
-        latents = latents * self.vae.config.scaling_factor
+        latents = self.vae.encode(pixel_values).latent
 
         prompt_embeds, prompt_attention_mask, _, _ = self.encode_prompt(
             prompt=prompt,
@@ -30,14 +27,15 @@ class AlchemistSanaPipeline(SanaPipeline):
             lora_scale=None,
         )
 
-        num_train_timesteps = self.scheduler.num_train_timesteps
+        num_train_timesteps = self.scheduler.config.num_train_timesteps
         t_clamped = float(t)
         t_clamped = max(0.0, min(1.0, t_clamped))
         timestep_idx = int(t_clamped * (num_train_timesteps - 1))
 
-        noise = torch.randn_like(latents, device=device)
+        timestep_tensor = torch.tensor([timestep_idx], device=device)
 
-        noisy_latents = self.scheduler.add_noise(latents, noise, timestep_idx)
+        noise = torch.randn_like(latents, device=device)
+        noisy_latents = self.scheduler.add_noise(latents, noise, timestep_tensor)
         self.noisy_latent = noisy_latents
 
         latent_model_input = noisy_latents.to(self.transformer.dtype)

@@ -11,6 +11,7 @@ from diffusers.models.attention_processor import Attention
 from diffusers.models.transformers.sana_transformer import SanaAttnProcessor2_0, SanaTransformer2DModel
 from diffusers.pipelines.sana import SanaPipeline
 from safetensors.torch import save_file, load_file
+from dataclasses import dataclass
 
 
 class SanaClassifierHead(nn.Module):
@@ -58,6 +59,13 @@ class CrossAttentionProjection(nn.Module):
         self._proj_states = self.proj(spatial_attn_l2)
         return self._proj_states
 
+@dataclass
+class SanaClassifierParameters:
+    proj_dim: int = 256,
+    hidden_dims: List[int] = [256, 128, 64],
+    num_classes: int = 1,
+    drop_p: float = 0.2,
+
 
 class SanaClassifier(nn.Module):
     """
@@ -69,23 +77,20 @@ class SanaClassifier(nn.Module):
     def __init__(
         self,
         num_layers: int,
-        proj_dim: int = 256,
-        hidden_dims: List[int] = [256, 128, 64],
-        num_classes: int = 1,
-        drop_p: float = 0.2,
+        clf_params: SanaClassifierParameters
     ):
         super().__init__()
-        self.num_layers = num_layers
-        self.proj_dim = proj_dim
-        self.hidden_dims = hidden_dims
-        self.num_classes = num_classes
-        self.drop_p = drop_p
+        self.num_layers = clf_params.num_layers
+        self.proj_dim = clf_params.proj_dim
+        self.hidden_dims = clf_params.hidden_dims
+        self.num_classes = clf_params.num_classes
+        self.drop_p = clf_params.drop_p
 
         self.clf_head = SanaClassifierHead(
-            input_dim=proj_dim,
-            hidden_dims=hidden_dims,
-            num_classes=num_classes,
-            drop_p=drop_p,
+            input_dim=self.proj_dim,
+            hidden_dims=self.hidden_dims,
+            num_classes=self.num_classes,
+            drop_p=self.drop_p,
         )
 
         # one alpha per attention layer we register
@@ -202,6 +207,13 @@ class ClassifierSanaAttnProcessor(SanaAttnProcessor2_0):
         return hidden_states
 
 
+@dataclass
+class ModelParameters:
+    prompt: str
+    t: float = .25
+    clf_params: SanaClassifierParameters
+
+
 class SanaClassifierPipeline(SanaPipeline):
     """
     Extends the standard SanaPipeline to insert a binary classification head on top of the
@@ -229,10 +241,7 @@ class SanaClassifierPipeline(SanaPipeline):
 
     def register_model(self, 
             transformer_blocks_ids: List[int], 
-            proj_dim: int = 256,
-            hidden_dims: List[int] = [256, 128, 64],
-            num_classes: int = 1,
-            drop_p: float = 0.2,
+            clf_params: SanaClassifierParameters
         ) -> None:
         """
         Replace the SanaAttnProcessor2_0 in each specified transformer block with
@@ -248,10 +257,7 @@ class SanaClassifierPipeline(SanaPipeline):
         # instantiate the classifier model with that many projection modules
         self.clf_model = SanaClassifier(
             num_layers=num_hooks,
-            proj_dim=proj_dim,
-            hidden_dims=hidden_dims,
-            num_classes=num_classes,
-            drop_p=drop_p,
+            clf_params=clf_params
         )
         existing_procs = self.transformer.attn_processors
         full_procs: Dict[str, nn.Module] = {}
@@ -338,6 +344,12 @@ class SanaClassifierPipeline(SanaPipeline):
             else:
                 cur = getattr(cur, p)
         return cur
+
+    def train(self):
+        self.clf_model.train()
+
+    def eval(self):
+        self.clf_model.eval()
 
     @torch.no_grad()
     def sana_forward(self, image: Union[Image.Image, torch.Tensor], prompt: str, t: float):

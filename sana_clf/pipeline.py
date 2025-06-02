@@ -11,7 +11,21 @@ from diffusers.models.attention_processor import Attention
 from diffusers.models.transformers.sana_transformer import SanaAttnProcessor2_0, SanaTransformer2DModel
 from diffusers.pipelines.sana import SanaPipeline
 from safetensors.torch import save_file, load_file
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass
+class SanaClassifierParameters:
+    proj_dim: int = 256
+    hidden_dims: List[int] = field(default_factory=lambda: [256, 128, 64])
+    num_classes: int = 1
+    drop_p: float = 0.2
+
+
+@dataclass
+class SanaText2ImgParameters:
+    prompt: str
+    t: float = .25
 
 
 class SanaClassifierHead(nn.Module):
@@ -43,12 +57,10 @@ class CrossAttentionProjection(nn.Module):
         super().__init__()
         # d_model = heads * seq_len
         self.proj = nn.Linear(d_model, proj_d)
-        self._proj_states: Optional[torch.Tensor] = None
+        self.attn_weights = None
 
     def get_proj_states(self) -> torch.Tensor:
-        if self._proj_states is None:
-            raise ValueError(f"No projection stored in {self.__class__.__name__} yet!")
-        return self._proj_states
+        return self.forward(self.attn_weights)
 
     def forward(self, attn_weights: torch.Tensor) -> torch.Tensor:
         # attn_weights: (batch, heads, seq_len, seq_len)
@@ -58,13 +70,6 @@ class CrossAttentionProjection(nn.Module):
         spatial_attn_l2 = spatial_attn_l2.view(B, -1)
         self._proj_states = self.proj(spatial_attn_l2)
         return self._proj_states
-
-@dataclass
-class SanaClassifierParameters:
-    proj_dim: int = 256,
-    hidden_dims: List[int] = [256, 128, 64],
-    num_classes: int = 1,
-    drop_p: float = 0.2,
 
 
 class SanaClassifier(nn.Module):
@@ -80,7 +85,7 @@ class SanaClassifier(nn.Module):
         clf_params: SanaClassifierParameters
     ):
         super().__init__()
-        self.num_layers = clf_params.num_layers
+        self.num_layers = num_layers
         self.proj_dim = clf_params.proj_dim
         self.hidden_dims = clf_params.hidden_dims
         self.num_classes = clf_params.num_classes
@@ -193,7 +198,7 @@ class ClassifierSanaAttnProcessor(SanaAttnProcessor2_0):
         )
         # now attn_weights has shape (batch, heads, seq_len, seq_len),
         # which we store into the projection module
-        self.proj(attn_weights)
+        self.proj.attn_weights = attn_weights
 
         hidden_states = attn_weights @ value  # (batch, heads, seq_len, head_dim)
 
@@ -207,13 +212,6 @@ class ClassifierSanaAttnProcessor(SanaAttnProcessor2_0):
         return hidden_states
 
 
-@dataclass
-class ModelParameters:
-    prompt: str
-    t: float = .25
-    clf_params: SanaClassifierParameters
-
-
 class SanaClassifierPipeline(SanaPipeline):
     """
     Extends the standard SanaPipeline to insert a binary classification head on top of the
@@ -221,23 +219,12 @@ class SanaClassifierPipeline(SanaPipeline):
     in selected transformer layers with ClassifierSanaAttnProcessor, which captures its attention weights.
     After a forward pass, we aggregate all per-layer projections through SanaClassifier and return logits.
     """
-
-    def __init__(
-        self,
-        *args,
-        **kwargs,
-    ):
-        """
-        Accepts all the same args as SanaPipeline, plus optional classifier parameters:
-        - proj_dim: dimensionality of each CrossAttentionProjection output
-        - hidden_dims: hidden layer sizes in the final MLP classification head
-        - num_classes: 1 for binary classification
-        - drop_p: dropout probability in the classification head
-        """
-        super().__init__(*args, **kwargs)
-        self.clf_model: Optional[SanaClassifier] = None
-        self._registered: bool = False
-        self._processors: Dict[str, ClassifierSanaAttnProcessor] = {}
+    clf_model: Optional[SanaClassifier] = None
+    _registered: bool = False
+    _processors: Dict[str, ClassifierSanaAttnProcessor] = {}
+    max_sequence_length: int = 300
+    t = .25
+    prompt = ""
 
     def register_model(self, 
             transformer_blocks_ids: List[int], 
@@ -252,9 +239,7 @@ class SanaClassifierPipeline(SanaPipeline):
         if self._registered:
             raise RuntimeError("Model has already been registered for classification.")
 
-        # number of layers we'll hook
         num_hooks = len(transformer_blocks_ids)
-        # instantiate the classifier model with that many projection modules
         self.clf_model = SanaClassifier(
             num_layers=num_hooks,
             clf_params=clf_params
@@ -271,7 +256,7 @@ class SanaClassifierPipeline(SanaPipeline):
                 if layer_idx in transformer_blocks_ids and isinstance(proc, SanaAttnProcessor2_0):
                     attn_path = name[: -len(".processor")]
                     attn_module = self._get_module_by_path(self.transformer, attn_path)
-                    seq_len = self.tokenizer.model_max_length
+                    seq_len = self.max_sequence_length
                     d_model = attn_module.heads * seq_len
                     proj = self.clf_model.create_proj(d_model)
                     new_proc = ClassifierSanaAttnProcessor(proj=proj)
@@ -288,9 +273,40 @@ class SanaClassifierPipeline(SanaPipeline):
                 f"Check that the transformer_blocks_ids match actual layers."
             )
         self.transformer.set_attn_processor(full_procs)
+        self.clf_model = self.clf_model.to(self.transformer.device, self.transformer.dtype)
         self._registered = True
 
-    def forward(self, image: Union[Image.Image, torch.Tensor], prompt: str, t: float) -> torch.Tensor:
+    @classmethod
+    def prepare_model(
+        cls,
+        pretrained_model: str,
+        transformer_layers: List[int],
+        clf_params: SanaClassifierParameters,
+        t2i_params: SanaText2ImgParameters,
+        device: str = "cuda",
+        dtype = torch.bfloat16
+    ):
+        """
+        Загружает SanaClassifierPipeline с заданной базовой моделью,
+        переводит в нужные dtype и регистрирует классификатор.
+        """
+        device_obj = torch.device(device)
+        try:
+            pipe = cls.from_pretrained(pretrained_model, torch_dtype=torch.float32)
+        except Exception:
+            from transformers import modeling_utils
+            if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
+                modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]
+            pipe = cls.from_pretrained(pretrained_model, torch_dtype=torch.float32)
+        pipe.to(device_obj)
+        pipe.text_encoder = pipe.text_encoder.to(dtype)
+        pipe.transformer = pipe.transformer.to(dtype)
+        pipe.register_model(transformer_blocks_ids=transformer_layers, clf_params=clf_params)
+        pipe.prompt = t2i_params.prompt
+        pipe.t = t2i_params.t
+        return pipe
+
+    def forward(self, image: Union[Image.Image, torch.Tensor], prompt: str = None, t: float = None) -> torch.Tensor:
         """
         Run one pass through the SANa U-Net, capturing the attention projections, then
         compute and return classification logits.
@@ -298,13 +314,12 @@ class SanaClassifierPipeline(SanaPipeline):
         - prompt: text prompt for conditioning
         - t: a float in [0,1] giving the fraction of the noise schedule
         """
+        prompt = prompt or self.prompt
+        t = t or self.t
         if not self._registered or self.clf_model is None:
             raise RuntimeError("Classifier pipeline not registered. Call register_model(...) first.")
 
-        # CrossAttentionProjection modules inside self.clf_model.projections via our custom processors.
         self.sana_forward(image, prompt, t)
-
-        # after sana_forward, each proj in self.clf_model.projections has its stored attention features.
         logits = self.clf_model()  # shape: (batch_size, num_classes)
         return logits
 
@@ -326,7 +341,6 @@ class SanaClassifierPipeline(SanaPipeline):
             raise RuntimeError("No classifier model instantiated. Call register_model(...) first.")
 
         path = str(load_path)
-        # load_file returns a dict of tensors already placed on the correct device if map_location is given
         state_dict = load_file(path, device=map_location if map_location is not None else "cpu")
         self.clf_model.load_state_dict(state_dict)
 
@@ -340,7 +354,7 @@ class SanaClassifierPipeline(SanaPipeline):
         for p in parts:
             if p.isdigit():
                 idx = int(p)
-                cur = cur[idx]  # assume cur is a ModuleList or list-like
+                cur = cur[idx]
             else:
                 cur = getattr(cur, p)
         return cur
@@ -365,49 +379,42 @@ class SanaClassifierPipeline(SanaPipeline):
 
         pixel_values = self.image_processor.preprocess(image).to(device)
         latents = self.vae.encode(pixel_values).latent
-
+        batch_size = latents.size()[0]
+        
         prompt_embeds, prompt_attention_mask, _, _ = self.encode_prompt(
             prompt=prompt,
             do_classifier_free_guidance=False,
             negative_prompt="",
-            num_images_per_prompt=1,
+            num_images_per_prompt=latents.size()[0],
             device=device,
             prompt_embeds=None,
             negative_prompt_embeds=None,
             prompt_attention_mask=None,
             negative_prompt_attention_mask=None,
             clean_caption=False,
-            max_sequence_length=self.tokenizer.model_max_length,
+            max_sequence_length=self.max_sequence_length,
             complex_human_instruction=None,
             lora_scale=None,
         )
 
-        # compute which timestep index corresponds to t in [0,1]
         num_train_timesteps = self.scheduler.config.num_train_timesteps
         t_clamped = float(t)
         t_clamped = max(0.0, min(1.0, t_clamped))
         timestep_idx = int(t_clamped * (num_train_timesteps - 1))
-        timestep_tensor = torch.tensor([timestep_idx], device=device)
+        timestep_idxs = torch.tensor([timestep_idx] * batch_size, device=device, dtype=torch.long)
 
-        # add noise at that timestep
         noise = torch.randn_like(latents, device=device)
-        noisy_latents = self.scheduler.add_noise(latents, noise, timestep_tensor)
-        self.noisy_latent = noisy_latents
+        noisy_latents = self.scheduler.add_noise(latents, noise, timestep_idxs)
 
-        # prepare input for transformer
         latent_model_input = noisy_latents.to(self.transformer.dtype)
-        timestep_tensor = torch.tensor([timestep_idx], device=device, dtype=latent_model_input.dtype)
+        timestep_tensor = timestep_idxs.to(latent_model_input.dtype)
         timestep_tensor = timestep_tensor * self.transformer.config.timestep_scale
 
-        # run the transformer: because we've replaced its attention processors,
-        # each cross-attention call will fill out the proj states in our classifier
-        noise_pred = self.transformer(
+        self.transformer(
             latent_model_input,
             encoder_hidden_states=prompt_embeds,
             encoder_attention_mask=prompt_attention_mask,
             timestep=timestep_tensor,
             return_dict=False,
             attention_kwargs=None,
-        )[0]
-
-        self.noise_pred = noise_pred
+        )

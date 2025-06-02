@@ -23,7 +23,7 @@ import wandb
 from transformers import get_linear_schedule_with_warmup
 from enum import Enum
 
-from .pipeline import SanaClassifierPipeline, ModelParameters
+from .pipeline import SanaClassifierPipeline, SanaClassifierParameters, SanaText2ImgParameters
 
 
 class OptimizerType(Enum):
@@ -84,7 +84,7 @@ def set_seed(seed: int):
 def prepare_model(
     pretrained_model: str,
     transformer_layers: List[int],
-    model_parameters: ModelParameters,
+    clf_parameters: SanaClassifierParameters,
     device: str = "cuda",
 ) -> SanaClassifierPipeline:
     """
@@ -96,15 +96,13 @@ def prepare_model(
         pipe = SanaClassifierPipeline.from_pretrained(pretrained_model, torch_dtype=torch.float32)
     except Exception:
         from transformers import modeling_utils
-
-        # Обход потенциальной проблемы с ALL_PARALLEL_STYLES
         if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
             modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]
         pipe = SanaClassifierPipeline.from_pretrained(pretrained_model, torch_dtype=torch.float32)
     pipe.to(device_obj)
     pipe.text_encoder = pipe.text_encoder.to(torch.bfloat16)
     pipe.transformer = pipe.transformer.to(torch.bfloat16)
-    pipe.register_model(transformer_blocks_ids=transformer_layers, clf_params=model_parameters.clf_params)
+    pipe.register_model(transformer_blocks_ids=transformer_layers, clf_params=clf_parameters)
     return pipe
 
 
@@ -154,7 +152,7 @@ def build_optimizer_scheduler(
     params_to_optimize = [p for p in pipe.parameters() if p.requires_grad]
     if optimizer_type == OptimizerType.ADAM:
         optimizer = optim.Adam(params_to_optimize, lr=lr)
-    else:  # ADAMW
+    else:
         optimizer = optim.AdamW(params_to_optimize, lr=lr, weight_decay=weight_decay)
 
     scheduler = None
@@ -215,7 +213,7 @@ def train_one_epoch(
     scheduler: Optional[Any],
     scheduler_type: SchedulerType,
     criterion: nn.Module,
-    model_parameters: ModelParameters,
+    # model_parameters: ModelParameters,
     device_obj: torch.device,
     verbose: bool,
     progress_bar: bool,
@@ -272,7 +270,7 @@ def train_one_epoch(
 def validate_one_epoch(
     pipe: SanaClassifierPipeline,
     val_loader: DataLoader,
-    model_parameters: ModelParameters,
+    # model_parameters: ModelParameters,
     device_obj: torch.device,
     output_dir: str,
     epoch: int,
@@ -380,7 +378,7 @@ def train(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     pretrained_model: str,
-    model_parameters: ModelParameters,
+    # model_parameters: ModelParameters,
     transformer_layers: List[int],
     output_dir: str,
     batch_size: int = 8,
@@ -559,10 +557,10 @@ def train(
 def evaluate(
     test_df: pd.DataFrame,
     pretrained_model: str,
-    model_parameters: ModelParameters,
+    # model_parameters: ModelParameters,
     transformer_layers: List[int],
     checkpoint_path: str,
-    threshold: float = .5
+    threshold: float = .5,
     batch_size: int = 8,
     device: str = "cuda",
     output_csv: str = "eval_results.csv",

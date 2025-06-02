@@ -12,6 +12,7 @@ from diffusers.models.transformers.sana_transformer import SanaAttnProcessor2_0,
 from diffusers.pipelines.sana import SanaPipeline
 from safetensors.torch import save_file, load_file
 from dataclasses import dataclass, field
+import itertools
 
 
 @dataclass
@@ -20,6 +21,7 @@ class SanaClassifierParameters:
     hidden_dims: List[int] = field(default_factory=lambda: [256, 128, 64])
     num_classes: int = 1
     drop_p: float = 0.2
+    n_heads: int = 4
 
 
 @dataclass
@@ -56,6 +58,7 @@ class CrossAttentionProjection(nn.Module):
     def __init__(self, d_model: int, proj_d: int):
         super().__init__()
         # d_model = heads * seq_len
+        self.layer_norm = nn.LayerNorm(d_model)
         self.proj = nn.Linear(d_model, proj_d)
         self.attn_weights = None
 
@@ -63,13 +66,39 @@ class CrossAttentionProjection(nn.Module):
         return self.forward(self.attn_weights)
 
     def forward(self, attn_weights: torch.Tensor) -> torch.Tensor:
-        # attn_weights: (batch, heads, seq_len, seq_len)
-        B, H, S, _ = attn_weights.shape
-        spatial_attn_l2 = torch.norm(attn_weights, dim=2)  # (B, H, S)
-        # flatten the last two dims: (B, H * S)
-        spatial_attn_l2 = spatial_attn_l2.view(B, -1)
-        self._proj_states = self.proj(spatial_attn_l2)
-        return self._proj_states
+        batch_size, head_num, head_dim, seq_len = attn_weights.shape
+        spatial_attn_l2 = torch.norm(attn_weights, dim=2)
+        spatial_attn_l2 = spatial_attn_l2.view(batch_size, -1) / head_dim ** .5
+        spatial_attn_l2 = self.layer_norm(spatial_attn_l2)
+        proj_states = self.proj(spatial_attn_l2)
+        return proj_states
+
+
+class LayerSelfAttentionAggregator(nn.Module):
+    def __init__(self, proj_dim: int, num_layers: int, n_heads: int = 4, dropout: float = .1):
+        super().__init__()
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, proj_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=proj_dim,
+            nhead=n_heads,
+            dim_feedforward=proj_dim * 2,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.ln_out = nn.LayerNorm(proj_dim)
+
+    def forward(self, h_stack: torch.Tensor) -> torch.Tensor:
+        """
+        h_stack: (B, L, D)
+        returns: (B, D) pooled representation
+        """
+        B, _, proj_dim = h_stack.size()
+        cls = self.cls_token.expand(B, -1, proj_dim) # (B,1,D)
+        x = torch.cat([cls, h_stack], dim=1) # (B,L+1,D)
+        x = self.encoder(x)
+        pooled = self.ln_out(x[:, 0]) # CLS output
+        return pooled
 
 
 class SanaClassifier(nn.Module):
@@ -78,6 +107,8 @@ class SanaClassifier(nn.Module):
     then feeds into a small MLP head to produce a final (binary) classification logit.
     """
     proj_module = CrossAttentionProjection
+    agg_module = LayerSelfAttentionAggregator
+    clf_head_module = SanaClassifierHead
 
     def __init__(
         self,
@@ -88,21 +119,23 @@ class SanaClassifier(nn.Module):
         self.num_layers = num_layers
         self.proj_dim = clf_params.proj_dim
         self.hidden_dims = clf_params.hidden_dims
+        self.n_heads = clf_params.n_heads
         self.num_classes = clf_params.num_classes
         self.drop_p = clf_params.drop_p
 
-        self.clf_head = SanaClassifierHead(
+        self.clf_head = self.clf_head_module(
             input_dim=self.proj_dim,
             hidden_dims=self.hidden_dims,
             num_classes=self.num_classes,
             drop_p=self.drop_p,
         )
 
-        # one alpha per attention layer we register
-        init_vals = torch.full((num_layers,), 1.0 / num_layers)
-        self.alpha = nn.Parameter(init_vals)
-
-        # hold CrossAttentionProjection modules in order
+        self.agg_block = self.agg_module(
+            proj_dim=self.proj_dim, 
+            num_layers=self.num_layers, 
+            n_heads=self.n_heads, 
+            dropout=self.drop_p
+        )
         self.projections = nn.ModuleList()
 
     def create_proj(self, d_model: int) -> CrossAttentionProjection:
@@ -128,9 +161,7 @@ class SanaClassifier(nn.Module):
             h = proj.get_proj_states()  # shape: (batch, proj_dim)
             pooled_feats.append(h)
 
-        # stack and weight by alpha
-        alphas = torch.softmax(self.alpha, dim=0)  # (num_layers,)
-        H = sum(alphas[i] * pooled_feats[i] for i in range(self.num_layers))
+        H = self.agg_block(torch.stack(pooled_feats, dim=1))
         logits = self.clf_head(H)  # (batch, num_classes)
         return logits
 
@@ -306,7 +337,7 @@ class SanaClassifierPipeline(SanaPipeline):
         pipe.t = t2i_params.t
         return pipe
 
-    def forward(self, image: Union[Image.Image, torch.Tensor], prompt: str = None, t: float = None) -> torch.Tensor:
+    def forward(self, image: Union[Image.Image, List[Image.Image]], prompt: str = None, t: float = None) -> torch.Tensor:
         """
         Run one pass through the SANa U-Net, capturing the attention projections, then
         compute and return classification logits.
@@ -318,6 +349,8 @@ class SanaClassifierPipeline(SanaPipeline):
         t = t or self.t
         if not self._registered or self.clf_model is None:
             raise RuntimeError("Classifier pipeline not registered. Call register_model(...) first.")
+        if prompt is None or len(prompt) == 0 or t is None:
+            raise RuntimeError("`prompt` and `t` is empty. Set it explicity or with register_model.")
 
         self.sana_forward(image, prompt, t)
         logits = self.clf_model()  # shape: (batch_size, num_classes)
@@ -418,3 +451,22 @@ class SanaClassifierPipeline(SanaPipeline):
             return_dict=False,
             attention_kwargs=None,
         )
+
+    def named_parameters(self):
+        return itertools.chain(
+            self.clf_model.named_parameters(),
+            self.transformer.named_parameters(),
+            self.vae.named_parameters(),
+            self.text_encoder.named_parameters(),
+        )
+
+    def parameters(self):
+        return itertools.chain(
+            self.clf_model.parameters(),
+            self.transformer.parameters(),
+            self.vae.parameters(),
+            self.text_encoder.parameters(),
+        )
+
+    def __call__(self, image: Union[Image.Image, List[Image.Image]], prompt: str = None, t: float = None) -> torch.Tensor:
+        return self.forward(image, prompt, t)

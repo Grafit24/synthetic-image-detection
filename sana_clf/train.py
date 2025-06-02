@@ -23,7 +23,12 @@ import wandb
 from transformers import get_linear_schedule_with_warmup
 from enum import Enum
 
-from .pipeline import SanaClassifierPipeline, SanaClassifierParameters, SanaText2ImgParameters
+from .pipeline import (
+    SanaClassifierPipeline,
+    SanaClassifierParameters,
+    SanaText2ImgParameters,
+)
+import itertools
 
 
 class OptimizerType(Enum):
@@ -45,9 +50,10 @@ class ImageLabelDataset(Dataset):
     Ожидает DataFrame с колонками ['fp', 'label'].
     """
 
-    def __init__(self, df: pd.DataFrame):
+    def __init__(self, df: pd.DataFrame, max_image_side: int):
         super().__init__()
         self.df = df.reset_index(drop=True)
+        self.max_image_side = max_image_side
 
     def __len__(self) -> int:
         return len(self.df)
@@ -57,6 +63,13 @@ class ImageLabelDataset(Dataset):
         fp = row["fp"]
         label = float(row["label"])
         image = Image.open(fp).convert("RGB")
+        w, h = image.size
+        max_side = max(w, h)
+        if max_side > self.max_image_side:
+            scale = self.max_image_side / max_side
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            image = image.resize((new_w, new_h), Image.LANCZOS)
         return image, torch.tensor(label, dtype=torch.float32), fp
 
 
@@ -81,42 +94,18 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def prepare_model(
-    pretrained_model: str,
-    transformer_layers: List[int],
-    clf_parameters: SanaClassifierParameters,
-    device: str = "cuda",
-) -> SanaClassifierPipeline:
-    """
-    Загружает SanaClassifierPipeline с заданной базовой моделью,
-    переводит в нужные dtype и регистрирует классификатор.
-    """
-    device_obj = torch.device(device)
-    try:
-        pipe = SanaClassifierPipeline.from_pretrained(pretrained_model, torch_dtype=torch.float32)
-    except Exception:
-        from transformers import modeling_utils
-        if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
-            modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]
-        pipe = SanaClassifierPipeline.from_pretrained(pretrained_model, torch_dtype=torch.float32)
-    pipe.to(device_obj)
-    pipe.text_encoder = pipe.text_encoder.to(torch.bfloat16)
-    pipe.transformer = pipe.transformer.to(torch.bfloat16)
-    pipe.register_model(transformer_blocks_ids=transformer_layers, clf_params=clf_parameters)
-    return pipe
-
-
 def build_dataloaders(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     batch_size: int,
+    max_image_side: int,
     num_workers: int = 4,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Создает DataLoader'ы для обучения и валидации.
     """
-    train_dataset = ImageLabelDataset(train_df)
-    val_dataset = ImageLabelDataset(val_df)
+    train_dataset = ImageLabelDataset(train_df, max_image_side=max_image_side)
+    val_dataset = ImageLabelDataset(val_df, max_image_side=max_image_side)
 
     train_loader = DataLoader(
         train_dataset,
@@ -213,7 +202,6 @@ def train_one_epoch(
     scheduler: Optional[Any],
     scheduler_type: SchedulerType,
     criterion: nn.Module,
-    # model_parameters: ModelParameters,
     device_obj: torch.device,
     verbose: bool,
     progress_bar: bool,
@@ -239,27 +227,27 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         losses = []
-        for i in range(batch_size_actual):
-            img = images[i]
-            label = labels[i : i + 1]
-            logits = pipe(img, model_parameters.prompt, model_parameters.t)
-            loss = criterion(logits, label)
-            losses.append(loss)
-
-        batch_loss = torch.stack(losses).mean()
+        logits = pipe(images)
+        batch_loss = criterion(logits, labels).mean()
         batch_loss.backward()
         optimizer.step()
 
+        current_lr = optimizer.param_groups[0]['lr']
+
         if scheduler is not None:
-            # для всех шейдеров выполняем шаг после optimizer.step()
             scheduler.step()
 
         epoch_loss += batch_loss.item()
+        if progress_bar:
+            iterator.set_postfix({"loss": f"{batch_loss.item():.4f}", "train/lr": f"{current_lr:.4f}",})
         global_step += 1
 
-        if wandb_enabled and global_step % logging_steps == 0:
-            avg_loss = epoch_loss / (batch_idx + 1)
-            wandb.log({"train/loss": avg_loss, "step": global_step})
+        if wandb_enabled:
+            wandb.log({
+                "train/loss": batch_loss.item(), 
+                "step": global_step, 
+                "train/lr": current_lr,
+            })
 
         if verbose and not progress_bar and global_step % logging_steps == 0:
             print(f"[Epoch {epoch} | Step {global_step}] train loss: {batch_loss.item():.4f}")
@@ -270,7 +258,6 @@ def train_one_epoch(
 def validate_one_epoch(
     pipe: SanaClassifierPipeline,
     val_loader: DataLoader,
-    # model_parameters: ModelParameters,
     device_obj: torch.device,
     output_dir: str,
     epoch: int,
@@ -302,7 +289,7 @@ def validate_one_epoch(
             preds_batch = []
             for i in range(batch_size_actual):
                 img = images[i]
-                logit = pipe(img, model_parameters.prompt, model_parameters.t)
+                logit = pipe(img)
                 prob = torch.sigmoid(logit).item()
                 pred = 1 if prob >= 0.5 else 0
                 probs_batch.append(prob)
@@ -378,7 +365,8 @@ def train(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     pretrained_model: str,
-    # model_parameters: ModelParameters,
+    cfg_params: SanaClassifierParameters,
+    t2i_params: SanaText2ImgParameters,
     transformer_layers: List[int],
     output_dir: str,
     batch_size: int = 8,
@@ -392,6 +380,7 @@ def train(
     save_steps: int = 200,
     seed: int = 42,
     device: str = "cuda",
+    wandb_enabled: bool = True,
     wandb_project: str = "sana-classifier",
     wandb_run_name: Optional[str] = None,
     resume_checkpoint: Optional[str] = None,
@@ -408,23 +397,32 @@ def train(
     """
     set_seed(seed)
 
-    # Проверка наличия необходимых колонок
     if "fp" not in train_df.columns or "label" not in train_df.columns:
         raise ValueError("train_df должен содержать колонки 'fp' и 'label'")
     if "fp" not in val_df.columns or "label" not in val_df.columns:
         raise ValueError("val_df должен содержать колонки 'fp' и 'label'")
 
-    # Создаем DataLoader'ы
-    train_loader, val_loader = build_dataloaders(train_df, val_df, batch_size)
+    max_image_side = 512 if "512px" in pretrained_model else 1024
+    train_loader, val_loader = build_dataloaders(train_df, val_df, batch_size, max_image_side)
 
-    # Готовим модель
-    pipe = prepare_model(pretrained_model, transformer_layers, model_parameters, device)
     device_obj = torch.device(device)
 
-    # Заморозим все параметры, кроме классификатора
-    for name, param in pipe.named_parameters():
-        if "clf_model" not in name:
-            param.requires_grad = False
+    # Подготовка pipeline с классификатором
+    pipe = SanaClassifierPipeline.prepare_model(
+        pretrained_model,
+        transformer_layers,
+        cfg_params,
+        t2i_params,
+        device=device,
+    )
+
+    # Freeze all except `clf_model`
+    for param in pipe.parameters():
+        param.requires_grad = False
+
+    for param in pipe.clf_model.parameters():
+        param.requires_grad = True
+    
 
     # Приводим типы enum
     if isinstance(optimizer_type, str):
@@ -437,12 +435,11 @@ def train(
         pipe, optimizer_type, lr, weight_decay, scheduler_type, warmup_steps, total_steps
     )
 
-    # Настройки для продолжения обучения
     start_epoch = 1
     global_step = 0
     if resume_checkpoint is not None:
         ckpt_dir = Path(resume_checkpoint)
-        pipe.load_clf(str(ckpt_dir / "classifier.safetensors"))
+        pipe.load_clf(str(ckpt_dir / "classifier.safetensors"), map_location=device_obj)
         ckpt = torch.load(ckpt_dir / "optimizer.pt", map_location=device_obj)
         optimizer.load_state_dict(ckpt["optimizer_state"])
         if "scheduler_state" in ckpt and scheduler is not None:
@@ -451,38 +448,35 @@ def train(
             start_epoch = ckpt["meta"]["epoch"] + 1
         if ckpt.get("meta", {}).get("global_step") is not None:
             global_step = ckpt["meta"]["global_step"]
-
-    # Инициализируем wandb
-    wandb_enabled = True
-    try:
-        wandb.init(
-            project=wandb_project,
-            name=wandb_run_name,
-            config={
-                "pretrained_model": pretrained_model,
-                "transformer_layers": transformer_layers,
-                "batch_size": batch_size,
-                "epochs": epochs,
-                "lr": lr,
-                "optimizer": optimizer_type.value,
-                "weight_decay": weight_decay,
-                "scheduler": scheduler_type.value,
-                "warmup_steps": warmup_steps,
-                "seed": seed,
-                **vars(model_parameters),
-            },
-        )
-    except Exception:
-        wandb_enabled = False
-        if verbose:
-            print("Не удалось инициализировать wandb. Логи не будут отправляться.")
+    if wandb_enabled:
+        try:
+            wandb.init(
+                project=wandb_project,
+                name=wandb_run_name,
+                config={
+                    "pretrained_model": pretrained_model,
+                    "transformer_layers": transformer_layers,
+                    "batch_size": batch_size,
+                    "epochs": epochs,
+                    "lr": lr,
+                    "optimizer": optimizer_type.value,
+                    "weight_decay": weight_decay,
+                    "scheduler": scheduler_type.value,
+                    "warmup_steps": warmup_steps,
+                    "seed": seed,
+                    **vars(cfg_params),
+                    **vars(t2i_params),
+                },
+            )
+        except Exception:
+            wandb_enabled = False
+            if verbose:
+                print("Не удалось инициализировать wandb. Логи не будут отправляться.")
 
     criterion = nn.BCEWithLogitsLoss()
     os.makedirs(output_dir, exist_ok=True)
 
-    # Цикл по эпохам
     for epoch in range(start_epoch, epochs + 1):
-        # Обучение за эпоху
         epoch_loss, global_step = train_one_epoch(
             pipe=pipe,
             train_loader=train_loader,
@@ -490,7 +484,6 @@ def train(
             scheduler=scheduler,
             scheduler_type=scheduler_type,
             criterion=criterion,
-            model_parameters=model_parameters,
             device_obj=device_obj,
             verbose=verbose,
             progress_bar=progress_bar,
@@ -507,7 +500,8 @@ def train(
                 "global_step": global_step,
                 "pretrained_model": pretrained_model,
                 "transformer_layers": transformer_layers,
-                **vars(model_parameters),
+                **vars(cfg_params),
+                **vars(t2i_params),
             }
             save_checkpoint(output_dir, f"step-{global_step}", pipe, optimizer, scheduler, meta_info, verbose)
 
@@ -517,7 +511,8 @@ def train(
             "global_step": global_step,
             "pretrained_model": pretrained_model,
             "transformer_layers": transformer_layers,
-            **vars(model_parameters),
+            **vars(cfg_params),
+            **vars(t2i_params),
         }
         save_checkpoint(output_dir, f"epoch-{epoch}", pipe, optimizer, scheduler, meta_info_epoch, verbose)
 
@@ -525,7 +520,6 @@ def train(
         metrics = validate_one_epoch(
             pipe=pipe,
             val_loader=val_loader,
-            model_parameters=model_parameters,
             device_obj=device_obj,
             output_dir=output_dir,
             epoch=epoch,
@@ -545,22 +539,25 @@ def train(
                 "epoch": epochs,
                 "pretrained_model": pretrained_model,
                 "transformer_layers": transformer_layers,
-                **vars(model_parameters),
+                **vars(cfg_params),
+                **vars(t2i_params),
             },
         },
         final_dir / "optimizer.pt",
     )
     if wandb_enabled:
         wandb.finish()
+    return pipe
 
 
 def evaluate(
     test_df: pd.DataFrame,
     pretrained_model: str,
-    # model_parameters: ModelParameters,
+    cfg_params: SanaClassifierParameters,
+    t2i_params: SanaText2ImgParameters,
     transformer_layers: List[int],
     checkpoint_path: str,
-    threshold: float = .5,
+    threshold: float = 0.5,
     batch_size: int = 8,
     device: str = "cuda",
     output_csv: str = "eval_results.csv",
@@ -578,8 +575,16 @@ def evaluate(
         raise ValueError("test_df должен содержать колонки 'fp' и 'label'")
 
     device_obj = torch.device(device)
-    pipe = prepare_model(pretrained_model, transformer_layers, model_parameters, device)
-    pipe.load_clf(str(Path(checkpoint_path) / "classifier.safetensors"))
+
+    # Подготовка pipeline с классификатором (без обучения)
+    pipe = SanaClassifierPipeline.prepare_model(
+        pretrained_model,
+        transformer_layers,
+        cfg_params,
+        t2i_params,
+        device=device,
+    )
+    pipe.load_clf(str(Path(checkpoint_path) / "classifier.safetensors"), map_location=device_obj)
     pipe.eval()
 
     dataset = ImageLabelDataset(test_df)
@@ -590,6 +595,7 @@ def evaluate(
         num_workers=4,
         collate_fn=collate_image_label,
         drop_last=False,
+        max_image_side=512 if "512px" in pretrained_model else 1024
     )
 
     all_probs: List[float] = []
@@ -609,7 +615,7 @@ def evaluate(
             preds_batch = []
             for i in range(batch_size_actual):
                 img = images[i]
-                logit = pipe(img, model_parameters.prompt, model_parameters.t)
+                logit = pipe(img)
                 prob = torch.sigmoid(logit).item()
                 pred = 1 if prob >= threshold else 0
                 probs_batch.append(prob)

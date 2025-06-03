@@ -187,16 +187,24 @@ class AlchemistStatsCollector:
 
 
 class AlchemistDataset(Dataset):
-    def __init__(self, file_paths: list[Path]):
+    def __init__(self, file_paths: list[Path], max_image_side=1024):
         self.file_paths = file_paths
+        self.max_image_side = max_image_side
 
     def __len__(self) -> int:
         return len(self.file_paths)
 
     def __getitem__(self, idx: int) -> Image.Image:
         img_path = self.file_paths[idx]
-        img = Image.open(img_path).convert("RGB")
-        return img
+        image = Image.open(img_path).convert("RGB")
+        w, h = image.size
+        max_side = max(w, h)
+        if max_side > self.max_image_side:
+            scale = self.max_image_side / max_side
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            image = image.resize((new_w, new_h), Image.LANCZOS)
+        return image
     
     @staticmethod
     def collate_pil_images(batch: list[Image.Image]) -> list[Image.Image]:
@@ -249,9 +257,9 @@ class Alchemist:
             raise RuntimeError("No separaion scores collected!")
         return self._topk_separation_scores
 
-    def collect_separation_scores(self, x_positive: list[Path], x_negative: list[Path]) -> torch.Tensor:
-        x_pos_ds = self.dataset(x_positive)
-        x_neg_ds = self.dataset(x_negative)
+    def collect_separation_scores(self, x_positive: list[Path], x_negative: list[Path], max_image_side=1024) -> torch.Tensor:
+        x_pos_ds = self.dataset(x_positive, max_image_side=max_image_side)
+        x_neg_ds = self.dataset(x_negative, max_image_side=max_image_side)
         pos_loader = DataLoader(
             x_pos_ds,
             batch_size=1,

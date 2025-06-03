@@ -2,6 +2,7 @@ import os
 import random
 from pathlib import Path
 from typing import List, Tuple, Optional, Union, Dict, Any
+import math
 
 import pandas as pd
 import torch
@@ -209,48 +210,76 @@ def train_one_epoch(
     global_step: int,
     logging_steps: int,
     wandb_enabled: bool,
+    micro_batch_size: int = 4,
 ) -> Tuple[float, int]:
-    """
-    Один проход по эпохе обучения.
-    Возвращает суммарный loss за эпоху и обновленный global_step.
-    """
     pipe.train()
     epoch_loss = 0.0
     total_batches = len(train_loader)
+
     iterator = enumerate(train_loader)
     if progress_bar:
-        iterator = tqdm(enumerate(train_loader), total=total_batches, desc=f"Epoch {epoch} [train]", leave=False)
+        iterator = tqdm(
+            enumerate(train_loader),
+            total=total_batches,
+            desc=f"Epoch {epoch} [train]",
+            leave=False,
+        )
 
     for batch_idx, (images, labels, _) in iterator:
+        labels = labels.to(device_obj).view(-1, 1)
+
         batch_size_actual = len(images)
-        labels = labels.to(device_obj).view(batch_size_actual, 1)
+        num_micro_batches = math.ceil(batch_size_actual / micro_batch_size)
 
         optimizer.zero_grad()
-        losses = []
-        logits = pipe(images)
-        batch_loss = criterion(logits, labels).mean()
-        batch_loss.backward()
+        batch_loss_sum = 0.0
+
+        for i in range(num_micro_batches):
+            start = i * micro_batch_size
+            end = min(start + micro_batch_size, batch_size_actual)
+
+            imgs_mb = images[start:end]
+            lbls_mb = labels[start:end]
+
+            logits_mb = pipe(imgs_mb)
+            loss_mb = criterion(logits_mb, lbls_mb).mean()
+            loss_mb_scaled = loss_mb / num_micro_batches
+            loss_mb_scaled.backward()
+
+            batch_loss_sum += loss_mb.item() * (lbls_mb.size(0))
+
         optimizer.step()
-
-        current_lr = optimizer.param_groups[0]['lr']
-
         if scheduler is not None:
             scheduler.step()
 
-        epoch_loss += batch_loss.item()
-        if progress_bar:
-            iterator.set_postfix({"loss": f"{batch_loss.item():.4f}", "train/lr": f"{current_lr:.4f}",})
-        global_step += 1
+        batch_loss_avg = batch_loss_sum / batch_size_actual
+        epoch_loss += batch_loss_avg
 
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        if progress_bar:
+            iterator.set_postfix(
+                {
+                    "loss": f"{batch_loss_avg:.4f}",
+                    "train/lr": f"{current_lr:.5f}",
+                }
+            )
+
+        global_step += 1
         if wandb_enabled:
-            wandb.log({
-                "train/loss": batch_loss.item(), 
-                "step": global_step, 
-                "train/lr": current_lr,
-            })
+            import wandb
+            wandb.log(
+                {
+                    "train/loss": batch_loss_avg,
+                    "step": global_step,
+                    "train/lr": current_lr,
+                }
+            )
 
         if verbose and not progress_bar and global_step % logging_steps == 0:
-            print(f"[Epoch {epoch} | Step {global_step}] train loss: {batch_loss.item():.4f}")
+            print(
+                f"[Epoch {epoch} | Step {global_step}] train loss: {batch_loss_avg:.4f}"
+            )
 
     return epoch_loss, global_step
 

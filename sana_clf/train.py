@@ -613,18 +613,21 @@ def evaluate(
         t2i_params,
         device=device,
     )
-    pipe.load_clf(str(Path(checkpoint_path) / "classifier.safetensors"), map_location=device_obj)
+    pipe.load_clf(str(Path(checkpoint_path) / "classifier.safetensors"), map_location="cpu")
+    pipe.clf_model.to(device_obj)
     pipe.eval()
 
-    dataset = ImageLabelDataset(test_df)
+    dataset = ImageLabelDataset(
+        test_df, 
+        max_image_side=512 if "512px" in pretrained_model else 1024
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=4,
         collate_fn=collate_image_label,
-        drop_last=False,
-        max_image_side=512 if "512px" in pretrained_model else 1024
+        drop_last=False
     )
 
     all_probs: List[float] = []
